@@ -1,7 +1,7 @@
 # RISE
 Reconnaissance Intelligence &amp; Synthesis Engine (under development)
 
-A simple recon tool I'm making, the tool is in its beginning phase, yet to add many features.
+A simple recon tool I'm making, the tool is in its beta phase, yet to add many features.
 
 RISE is a comprehensive, modular reconnaissance tool designed for security professionals and penetration testers. It performs automated intelligence gathering on target domains through multiple concurrent scanning modules.
 
