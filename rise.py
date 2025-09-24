@@ -8,11 +8,12 @@ import socket
 import sys
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -21,6 +22,37 @@ try:
 except ImportError:
     print("Error: 'dnspython' is not installed. Please run: pip install dnspython")
     sys.exit(1)
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Error: 'beautifulsoup4' is not installed. Please run: pip install beautifulsoup4")
+    sys.exit(1)
+
+
+# --- CMS Signatures Database ---
+CMS_SIGNATURES = {
+    "WordPress": {"meta_generator": "WordPress", "html_comments": "wp-content", "path_indicators": ["/wp-content/", "/wp-includes/", "/wp-json/"]},
+    "Joomla": {"meta_generator": "Joomla", "html_comments": "Joomla!", "path_indicators": ["/components/", "/modules/", "/templates/", "/media/"]},
+    "Drupal": {"meta_generator": "Drupal", "html_comments": "Drupal", "path_indicators": ["/sites/", "/core/", "/misc/", "/profiles/"]},
+    "Magento": {"meta_generator": "Magento", "html_comments": "Mage", "path_indicators": ["/static/frontend/", "/media/catalog/"]},
+    "Prestashop": {"meta_generator": "PrestaShop", "html_comments": "PrestaShop", "path_indicators": ["/themes/", "/modules/", "/img/", "/js/"]},
+    "OpenCart": {"meta_generator": "OpenCart", "html_comments": "OpenCart", "path_indicators": ["/catalog/view/", "/admin/controller/", "/system/storage/"]},
+    "Shopify": {"meta_generator": "Shopify", "html_comments": "Shopify", "path_indicators": ["/cdn.shopify.com", "/assets/"]},
+    "TYPO3": {"meta_generator": "TYPO3", "html_comments": "TYPO3", "path_indicators": ["/typo3conf/", "/typo3_src/", "/typo3temp/"]},
+    "Ghost": {"meta_generator": "Ghost", "html_comments": "Ghost", "path_indicators": ["/ghost/", "/content/"]},
+    "ExpressionEngine": {"meta_generator": "ExpressionEngine", "html_comments": "ExpressionEngine", "path_indicators": ["/themes/ee/"]},
+    "Wix": {"meta_generator": "Wix.com", "html_comments": "wix.com", "path_indicators": ["/wixpress/"]},
+    "Weebly": {"meta_generator": "Weebly", "html_comments": "weebly", "path_indicators": ["/files/theme/"]},
+    "Squarespace": {"meta_generator": "Squarespace", "html_comments": "squarespace", "path_indicators": ["/config.json", "/universal/"]},
+    "Blogger": {"meta_generator": "blogger", "html_comments": "blogger", "path_indicators": ["/feeds/posts/"]},
+    "Bitrix": {"meta_generator": "Bitrix", "html_comments": "bitrix", "path_indicators": ["/bitrix/"]},
+    "Django CMS": {"meta_generator": "Django", "html_comments": "django", "path_indicators": ["/static/django/"]},
+    "Craft CMS": {"meta_generator": "Craft CMS", "html_comments": "craftcms", "path_indicators": ["/craft/"]},
+    "Umbraco": {"meta_generator": "Umbraco", "html_comments": "umbraco", "path_indicators": ["/umbraco/"]},
+    "MODX": {"meta_generator": "MODX", "html_comments": "modx", "path_indicators": ["/manager/assets/"]},
+    "Contao": {"meta_generator": "Contao", "html_comments": "contao", "path_indicators": ["/contao/"]}
+}
 
 
 # --- Configuration Management ---
@@ -202,18 +234,6 @@ def validate_domain(domain: str) -> bool:
     return True
 
 
-def progress_bar(current: int, total: int, prefix: str = "", length: int = 40):
-    """Displays a simple, clean progress bar in the console."""
-    if total == 0:
-        return
-    percent = f"{100 * (current / float(total)):.1f}"
-    filled_length = int(length * current // total)
-    bar = '█' * filled_length + '-' * (length - filled_length)
-    print(f'\r{prefix} |{bar}| {percent}% ({current}/{total})', end='', flush=True)
-    if current == total:
-        print()
-
-
 # --- Network Utilities ---
 class NetworkUtils:
     """A collection of static methods for common network operations."""
@@ -237,6 +257,80 @@ class NetworkUtils:
         except (socket.gaierror, socket.timeout, OSError):
             return False
 
+# --- Helper Class for Email Harvesting ---
+class EmailHarvester:
+    """A multi-threaded web crawler to find email addresses."""
+    def __init__(self, base_url: str, session: requests.Session, max_pages: int = 50, num_threads: int = 10):
+        self.base_url = base_url
+        self.session = session
+        self.visited_urls = set()
+        self.emails_found = set()
+        self.urls_queue = deque()
+        self.max_pages = max_pages
+        self.num_threads = num_threads
+        self.page_count = 0
+        self._lock = threading.Lock()
+
+    def crawl(self):
+        """Starts the crawling process with multiple threads."""
+        self.urls_queue.append(self.base_url)
+        threads = [threading.Thread(target=self.worker) for _ in range(self.num_threads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()  # Wait for all threads to complete their work
+
+    def worker(self):
+        """The target function for each crawling thread."""
+        while True:
+            try:
+                with self._lock:
+                    if not self.urls_queue or self.page_count >= self.max_pages:
+                        break  # Stop condition for the thread
+                    url = self.urls_queue.popleft()
+                    if url in self.visited_urls:
+                        continue
+                    self.visited_urls.add(url)
+                    self.page_count += 1
+                
+                response = self.session.get(url, timeout=10)
+                if response.status_code == 200 and 'text/html' in response.headers.get('Content-Type', ''):
+                    html_content = response.text
+                    self.extract_emails(html_content)
+                    self.extract_links(html_content, url)
+            except IndexError:
+                break  # Queue is empty, thread can finish
+            except requests.RequestException as e:
+                logging.warning(f"EmailHarvester error crawling {url}: {e}")
+
+    def extract_emails(self, html_content: str):
+        """Finds all emails in the given HTML content using regex."""
+        emails = set(re.findall(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+', html_content))
+        with self._lock:
+            new_emails = emails - self.emails_found
+            self.emails_found.update(new_emails)
+
+    def extract_links(self, html_content: str, current_url: str):
+        """Parses HTML for new links to add to the crawl queue."""
+        soup = BeautifulSoup(html_content, 'html.parser')
+        new_urls_to_add = []
+        for link_tag in soup.find_all('a', href=True):
+            href = link_tag['href']
+            full_url = urljoin(current_url, href)
+            if self.is_valid_url(full_url):
+                 with self._lock:
+                    if full_url not in self.visited_urls and full_url not in self.urls_queue:
+                        new_urls_to_add.append(full_url)
+        if new_urls_to_add:
+            with self._lock:
+                self.urls_queue.extend(new_urls_to_add)
+
+    def is_valid_url(self, url: str) -> bool:
+        """Checks if a URL is on the same domain and uses a valid scheme."""
+        parsed_base = urlparse(self.base_url)
+        parsed_url = urlparse(url)
+        return (parsed_url.scheme in ('http', 'https') and
+                parsed_url.netloc == parsed_base.netloc)
 
 # --- Core Scanning Modules ---
 class ScannerModules:
@@ -281,12 +375,15 @@ class ScannerModules:
         )
         self.result_manager.add_result(scan_result)
         logging.info(f"Finished module '{module_name}' in {duration:.2f}s. Success: {success}")
+
+        print_scan_result(scan_result)
+
         return success
 
     def dns_enumeration(self, target: str) -> Tuple[List[str], Dict]:
         """Performs comprehensive DNS record enumeration."""
         results: List[str] = []
-        record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'SOA', 'CNAME']
+        record_types = ['A', 'AAAA', 'MX', 'NS', 'TXT', 'CNAME', 'SOA']
         resolver = dns.resolver.Resolver()
         resolver.timeout = self.config.get('timeout', 10)
 
@@ -294,11 +391,13 @@ class ScannerModules:
             try:
                 answers = resolver.resolve(target, r_type)
                 for rdata in answers:
-                    results.append(f"{r_type:<5} -> {rdata.to_text()}")
-            except (dns.resolver.NoAnswer, dns.resolver.NXDOMAIN):
+                    results.append(f"{r_type:<5} -> {str(rdata)}")
+            except dns.resolver.NoAnswer:
                 logging.debug(f"No {r_type} records found for {target}")
-            except Exception as e:
-                logging.warning(f"DNS query for {r_type} failed: {e}")
+            except dns.resolver.NXDOMAIN:
+                raise dns.resolver.NXDOMAIN(f"Domain '{target}' does not exist.")
+            except dns.exception.DNSException as e:
+                logging.warning(f"Error retrieving {r_type} records for {target}: {e}")
 
         return results, {"record_types_queried": record_types}
 
@@ -320,10 +419,7 @@ class ScannerModules:
         return list(found_subdomains), {"wordlist_size": len(wordlist)}
 
     def port_scanning(self, target: str, port_range: str) -> Tuple[List[str], Dict]:
-        """
-        Scans for open TCP ports concurrently.
-        Supports 'common' and 'extended' port ranges from config.
-        """
+        """Scans for open TCP ports concurrently."""
         open_ports: List[str] = []
         target_ip = NetworkUtils.resolve_domain(target)
         if not target_ip:
@@ -355,9 +451,7 @@ class ScannerModules:
         return open_ports, metadata
 
     def web_technology_detection(self, target: str) -> Tuple[List[str], Dict]:
-        """
-        Analyzes a web server to detect technologies, headers, and common files.
-        """
+        """Analyzes a web server to detect technologies, headers, and common files."""
         results: List[str] = []
         urls_to_check = [f"https://{target}", f"http://{target}"]
         final_url = ""
@@ -368,18 +462,14 @@ class ScannerModules:
                 final_url = response.url
                 results.append(f"URL Tested: {url} -> Status: {response.status_code} (Final: {final_url})")
 
-                # Server and framework headers
                 server = response.headers.get('Server', 'N/A')
                 powered_by = response.headers.get('X-Powered-By', 'N/A')
                 results.append(f"Server Header: {server}")
                 results.append(f"X-Powered-By: {powered_by}")
 
-                # Security headers check
                 sec_headers = {
-                    'Strict-Transport-Security': 'Missing',
-                    'Content-Security-Policy': 'Missing',
-                    'X-Frame-Options': 'Missing',
-                    'X-Content-Type-Options': 'Missing',
+                    'Strict-Transport-Security': 'Missing', 'Content-Security-Policy': 'Missing',
+                    'X-Frame-Options': 'Missing', 'X-Content-Type-Options': 'Missing',
                 }
                 for header in sec_headers:
                     if header in response.headers:
@@ -387,7 +477,6 @@ class ScannerModules:
                 for h, status in sec_headers.items():
                     results.append(f"Security Header '{h}': {status}")
 
-                # Check for common files
                 for path in ['/robots.txt', '/sitemap.xml', '/security.txt']:
                     try:
                         path_res = self.session.get(f"{url.rstrip('/')}{path}", timeout=5)
@@ -395,10 +484,7 @@ class ScannerModules:
                             results.append(f"Found accessible file: {path_res.url}")
                     except requests.RequestException:
                         pass
-
-                # Only test one URL if successful
                 break
-
             except requests.RequestException as e:
                 logging.warning(f"Could not connect to {url}: {e}")
 
@@ -406,6 +492,120 @@ class ScannerModules:
             raise ConnectionError("Could not connect to the target via HTTP or HTTPS.")
 
         return results, {"final_url": final_url}
+
+    def cms_detection(self, target: str) -> Tuple[List[str], Dict]:
+        """Identifies the Content Management System (CMS) used by the target website."""
+        results: List[str] = []
+        response = None
+        final_url = ""
+
+        for scheme in ["https", "http"]:
+            url = f"{scheme}://{target}"
+            try:
+                res = self.session.get(url, timeout=self.config.get('timeout', 10), allow_redirects=True)
+                if res.status_code < 400:
+                    final_url = res.url
+                    response = res
+                    break
+            except requests.RequestException:
+                continue
+
+        if not final_url or not response:
+            raise ConnectionError("Could not connect to the target via HTTP or HTTPS to perform CMS detection.")
+
+        soup = BeautifulSoup(response.content, 'html.parser')
+        html_content = response.text
+
+        # Check meta generator tag
+        meta_tag = soup.find("meta", {"name": "generator"})
+        if meta_tag and meta_tag.get("content"):
+            meta_content = meta_tag.get("content", "")
+            for cms, details in CMS_SIGNATURES.items():
+                if details["meta_generator"].lower() in meta_content.lower():
+                    results.append(f"Detected via meta tag: {cms}")
+                    return results, {"method": "meta_generator", "url_checked": final_url}
+
+        # Check HTML comments and page source
+        for cms, details in CMS_SIGNATURES.items():
+            if details["html_comments"].lower() in html_content.lower():
+                results.append(f"Detected via page source: {cms}")
+                return results, {"method": "html_source", "url_checked": final_url}
+
+        # Check common paths
+        base_url = f"{urlparse(final_url).scheme}://{urlparse(final_url).netloc}"
+        for cms, details in CMS_SIGNATURES.items():
+            for path in details["path_indicators"]:
+                test_url = f"{base_url.rstrip('/')}{path}"
+                try:
+                    path_response = self.session.get(test_url, timeout=5, allow_redirects=True)
+                    if path_response.status_code == 200:
+                        results.append(f"Detected via path: {cms} (found {test_url})")
+                        return results, {"method": "path_indicator", "url_checked": test_url}
+                except requests.RequestException:
+                    continue
+
+        return results, {"method": "all", "url_checked": final_url}
+
+    def email_harvesting(self, target: str) -> Tuple[List[str], Dict]:
+        """Crawls a website to find and collect email addresses."""
+        base_url = f"https://{target}"
+        try:
+            self.session.head(base_url, timeout=5)
+        except requests.RequestException:
+            base_url = f"http://{target}"  # Fallback to http
+
+        max_pages = self.config.get("max_crawl_pages", 50)
+        num_threads = self.config.get("max_threads", 10)
+        
+        harvester = EmailHarvester(
+            base_url=base_url,
+            session=self.session,
+            max_pages=max_pages,
+            num_threads=num_threads
+        )
+        
+        logging.info(f"Starting email harvester crawl on {base_url} (max {max_pages} pages)")
+        harvester.crawl()
+        
+        found_emails = list(harvester.emails_found)
+        metadata = {
+            "base_url_crawled": base_url,
+            "pages_crawled": harvester.page_count,
+            "emails_found_count": len(found_emails)
+        }
+        return found_emails, metadata
+
+    def ip_geolocation(self, target: str) -> Tuple[List[str], Dict]:
+        """Retrieves geolocation and network information for the target's IP."""
+        results: List[str] = []
+        target_ip = NetworkUtils.resolve_domain(target)
+        if not target_ip:
+            raise ConnectionError(f"Could not resolve '{target}' to an IP address.")
+
+        api_url = f"http://ip-api.com/json/{target_ip}"
+        try:
+            response = self.session.get(api_url, timeout=self.config.get('timeout', 10))
+            response.raise_for_status()
+            data = response.json()
+
+            if data.get('status') == 'success':
+                keys_to_display = [
+                    'query', 'country', 'city', 'regionName', 'zip', 'lat', 'lon',
+                    'timezone', 'isp', 'org', 'as'
+                ]
+                for key in keys_to_display:
+                    if key in data and data[key]:
+                        results.append(f"{key.replace('_', ' ').title():<15} -> {data[key]}")
+                if 'lat' in data and 'lon' in data:
+                    map_link = f"https://www.google.com/maps?q={data['lat']},{data['lon']}"
+                    results.append(f"{'Map Link':<15} -> {map_link}")
+            else:
+                raise ValueError(f"IP API returned an error: {data.get('message', 'Unknown error')}")
+
+        except requests.RequestException as e:
+            raise ConnectionError(f"Failed to retrieve IP information: {e}") from e
+
+        return results, {"target_ip": target_ip}
 
     def run_all_modules(self, target: str, port_range: str) -> bool:
         """Executes all available scanning modules sequentially."""
@@ -415,6 +615,9 @@ class ScannerModules:
         all_success &= self._run_module(self.subdomain_enumeration, target)
         all_success &= self._run_module(self.port_scanning, target, port_range)
         all_success &= self._run_module(self.web_technology_detection, target)
+        all_success &= self._run_module(self.cms_detection, target)
+        all_success &= self._run_module(self.email_harvesting, target)
+        all_success &= self._run_module(self.ip_geolocation, target)
         return all_success
 
 
@@ -427,13 +630,10 @@ def generate_report(result_manager: ResultManager, target: str, report_format: s
 
     if report_format in ["json", "all"]:
         result_manager.export_json(f"{base_filename}.json")
-
     if report_format in ["txt", "all"]:
         _generate_text_report(result_manager, target, f"{base_filename}.txt")
-
     if report_format in ["html", "all"]:
         _generate_html_report(result_manager, target, f"{base_filename}.html")
-
     print(f"\n[+] Reports generated in: {result_manager.output_dir.resolve()}")
 
 
@@ -441,19 +641,16 @@ def _generate_text_report(result_manager: ResultManager, target: str, filename: 
     """Generates a detailed plain-text report."""
     filepath = result_manager.output_dir / filename
     summary = result_manager.get_summary()
-
     with filepath.open('w') as f:
         f.write("=" * 80 + "\n")
         f.write("RISE: Reconnaissance Intelligence & Synthesis Engine - Report\n")
         f.write("=" * 80 + "\n")
         f.write(f"Target: {target}\n")
         f.write(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
-
         f.write("--- Executive Summary ---\n")
         for key, value in summary.items():
             f.write(f"{key.replace('_', ' ').title():<20}: {value}\n")
         f.write("\n")
-
         for result in result_manager.results:
             f.write("-" * 80 + "\n")
             f.write(f"Module: {result.module.upper()}\n")
@@ -472,8 +669,6 @@ def _generate_html_report(result_manager: ResultManager, target: str, filename: 
     """Generates a modern, responsive HTML report."""
     filepath = result_manager.output_dir / filename
     summary = result_manager.get_summary()
-
-    # HTML template with embedded CSS
     html_template = """
     <!DOCTYPE html>
     <html lang="en">
@@ -506,19 +701,14 @@ def _generate_html_report(result_manager: ResultManager, target: str, filename: 
                 <p><strong>Target:</strong> {target}</p>
                 <p><strong>Generated:</strong> {timestamp}</p>
             </div>
-            <div class="summary">
-                {summary_items}
-            </div>
+            <div class="summary">{summary_items}</div>
             {module_results}
         </div>
     </body>
-    </html>
-    """
-
+    </html>"""
     summary_items_html = ""
     for key, value in summary.items():
         summary_items_html += f'<div class="summary-item"><span>{key.replace("_", " ").title()}</span><strong>{value}</strong></div>'
-
     module_results_html = ""
     for result in result_manager.results:
         status_class = "success" if result.success else "failed"
@@ -532,33 +722,42 @@ def _generate_html_report(result_manager: ResultManager, target: str, filename: 
             findings_html = f'<p class="error-msg">Error: {result.error_message}</p>'
         else:
             findings_html = "<p>No findings.</p>"
-
         module_results_html += f"""
         <div class="module">
             <div class="module-header {status_class}">
                 <span>{result.module.upper()}</span>
                 <span>{result.duration:.2f}s</span>
             </div>
-            <div class="module-content">
-                {findings_html}
-            </div>
-        </div>
-        """
-
+            <div class="module-content">{findings_html}</div>
+        </div>"""
     report_content = html_template.format(
-        target=target,
-        timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        summary_items=summary_items_html,
-        module_results=module_results_html
+        target=target, timestamp=datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        summary_items=summary_items_html, module_results=module_results_html
     )
-
     with filepath.open('w') as f:
         f.write(report_content)
 
 
 # --- UI & Main Application Logic ---
+def print_scan_result(result: ScanResult):
+    """Formats and prints a single ScanResult to the console."""
+    header = f" Results for {result.module.upper()} "
+    print("\n\n" + f"{header:=^60}")
+    if result.success:
+        if result.results:
+            print(f"Findings ({len(result.results)}):")
+            for item in result.results:
+                print(f"  [+] {item}")
+        else:
+            print("  [+] No findings for this module.")
+    else:
+        print(f"  [!] Module failed to run.")
+        if result.error_message:
+            print(f"  [!] Error: {result.error_message}")
+    print(f"{'='*60}\n")
+
+
 def display_banner():
-    """Displays the application's ASCII art banner."""
     banner = """
 ██████╗ ██╗███████╗███████╗
 ██╔══██╗██║██╔════╝██╔════╝
@@ -566,7 +765,7 @@ def display_banner():
 ██╔══██╗██║╚════██║██╔══╝
 ██║  ██║██║███████║███████╗
 ╚═╝  ╚═╝╚═╝╚══════╝╚══════╝
-Reconnaissance Intelligence & Synthesis Engine v3.0
+Reconnaissance Intelligence & Synthesis Engine
     """
     print(banner)
 
@@ -580,10 +779,13 @@ def display_menu():
     print("  [2] Subdomain Discovery")
     print("  [3] Port Scanning")
     print("  [4] Web Technology Detection")
-    print("  [5] Run Full Reconnaissance (All Modules)")
+    print("  [5] CMS Detection")
+    print("  [6] Email Harvesting")
+    print("  [7] IP Geolocation")
+    print("  [8] Run Full Reconnaissance (All Modules)")
     print("-" * 60)
-    print("  [6] Generate Report")
-    print("  [7] Show Results Summary")
+    print("  [9] Generate Report")
+    print("  [10] Show Results Summary")
     print("  [0] Exit")
     print("="*60)
 
@@ -597,24 +799,19 @@ def parse_arguments():
     parser.add_argument('target', nargs='?', help='The target domain to scan (e.g., example.com).')
     parser.add_argument(
         '-m', '--module',
-        choices=['dns', 'subdomain', 'port', 'web', 'all'],
+        choices=['dns', 'subdomain', 'port', 'web', 'cms', 'email', 'ip_geo', 'all'],
         help='Run a specific module or all modules.'
     )
     parser.add_argument(
-        '--ports',
-        choices=['common', 'extended'],
-        default='common',
+        '--ports', choices=['common', 'extended'], default='common',
         help="Port range for port scanning (default: common)."
     )
     parser.add_argument(
-        '--format',
-        choices=['txt', 'json', 'html', 'all'],
-        default='all',
+        '--format', choices=['txt', 'json', 'html', 'all'], default='all',
         help="Report output format (default: all)."
     )
     parser.add_argument(
-        '--no-interactive',
-        action='store_true',
+        '--no-interactive', action='store_true',
         help='Run in non-interactive mode. Requires a target and module.'
     )
     return parser.parse_args()
@@ -632,12 +829,10 @@ def main():
         if not args.target or not args.module:
             print("Error: Non-interactive mode requires a target and a module (--module).")
             sys.exit(1)
-        
         target = args.target
         if not validate_domain(target):
             print(f"Error: Invalid target domain '{target}'.")
             sys.exit(1)
-
         if args.module == 'dns':
             scanner._run_module(scanner.dns_enumeration, target)
         elif args.module == 'subdomain':
@@ -646,21 +841,25 @@ def main():
             scanner._run_module(scanner.port_scanning, target, args.ports)
         elif args.module == 'web':
             scanner._run_module(scanner.web_technology_detection, target)
+        elif args.module == 'cms':
+            scanner._run_module(scanner.cms_detection, target)
+        elif args.module == 'email':
+            scanner._run_module(scanner.email_harvesting, target)
+        elif args.module == 'ip_geo':
+            scanner._run_module(scanner.ip_geolocation, target)
         elif args.module == 'all':
             scanner.run_all_modules(target, args.ports)
-        
         generate_report(result_manager, target, args.format)
         print("\n[+] Non-interactive scan complete.")
         sys.exit(0)
 
-    # --- Interactive Mode ---
     display_banner()
     target = ""
     while not target:
         try:
             raw_target = input("Enter target domain (e.g., example.com): ").strip()
             if validate_domain(raw_target):
-                target = urlparse(f"//{raw_target}").netloc  # Normalize
+                target = urlparse(f"//{raw_target}").netloc
                 print(f"[+] Target set to: {target}")
             else:
                 print("Error: Invalid domain format. Please try again.")
@@ -672,7 +871,6 @@ def main():
         display_menu()
         try:
             choice = input("Enter your choice: ").strip()
-
             if choice == '1':
                 scanner._run_module(scanner.dns_enumeration, target)
             elif choice == '2':
@@ -680,27 +878,30 @@ def main():
             elif choice == '3':
                 port_range = input("Enter port range [common/extended] (common): ").strip().lower() or "common"
                 if port_range not in ['common', 'extended']:
-                    print("Invalid range. Defaulting to 'common'.")
                     port_range = 'common'
                 scanner._run_module(scanner.port_scanning, target, port_range)
             elif choice == '4':
                 scanner._run_module(scanner.web_technology_detection, target)
             elif choice == '5':
+                scanner._run_module(scanner.cms_detection, target)
+            elif choice == '6':
+                scanner._run_module(scanner.email_harvesting, target)
+            elif choice == '7':
+                scanner._run_module(scanner.ip_geolocation, target)
+            elif choice == '8':
                 port_range = input("Enter port range for full scan [common/extended] (common): ").strip().lower() or "common"
                 if port_range not in ['common', 'extended']:
-                    print("Invalid range. Defaulting to 'common'.")
                     port_range = 'common'
                 scanner.run_all_modules(target, port_range)
-            elif choice == '6':
+            elif choice == '9':
                 if not result_manager.results:
                     print("\n[!] No results to report. Please run a scan first.")
                     continue
                 report_format = input("Enter report format [txt/json/html/all] (all): ").strip().lower() or "all"
                 if report_format not in ['txt', 'json', 'html', 'all']:
-                    print("Invalid format. Defaulting to 'all'.")
                     report_format = 'all'
                 generate_report(result_manager, target, report_format)
-            elif choice == '7':
+            elif choice == '10':
                 if not result_manager.results:
                     print("\n[!] No results to display. Please run a scan first.")
                     continue
@@ -713,10 +914,9 @@ def main():
                 break
             else:
                 print("\n[!] Invalid choice. Please select a valid option.")
-
         except KeyboardInterrupt:
-            print("\n\n[+] Returning to main menu.")
-            continue
+            print("\n\n[+] Exiting RISE. Goodbye!")
+            sys.exit(0)
         except Exception as e:
             logging.error(f"An error occurred in the main loop: {e}")
             print(f"\n[!] An unexpected error occurred: {e}")
